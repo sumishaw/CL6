@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Caption Lens</string>
+    <string name="accessibility_description">Captures internal video audio and translates to Hindi subtitles</string>
+</resources>

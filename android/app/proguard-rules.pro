@@ -1,0 +1,3 @@
+-keep class com.example.nihongolens.** { *; }
+-keep class io.flutter.** { *; }
+-dontwarn kotlin.**
