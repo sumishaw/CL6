@@ -123,20 +123,19 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    /**
-     * Called on main thread for every new translation from Whisper.
-     * Shows ONLY the Hindi translation — no source language text shown.
-     * The source text field (srcTv) is intentionally left blank always.
-     */
     private fun onNewText(original: String, hindi: String) {
-        if (hindi.isBlank()) return
+        // Show Hindi if available, fall back to source text so overlay is never blank
+        val displayText = when {
+            hindi.isNotBlank() -> hindi.trim()
+            original.isNotBlank() -> original.trim()  // fallback: show source while CT2 warms up
+            else -> return
+        }
 
         displayRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
 
-        // Show ONLY Hindi — source language (Japanese/English/etc.) never shown
-        srcTv?.text   = ""        // always blank — no dual-language display
-        hindiTv?.text = hindi.trim()
+        srcTv?.text   = ""
+        hindiTv?.text = displayText
 
         showOverlay()
         rescheduleSilence()
