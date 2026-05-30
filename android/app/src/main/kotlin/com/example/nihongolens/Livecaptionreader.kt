@@ -148,9 +148,9 @@ class LiveCaptionReader : AccessibilityService() {
                 }
 
                 if (sendText == null) {
-                    // Log every 10 watchdog ticks if nothing is being read
-                    if (watchdogTick % 10 == 0L) {
-                        CaptionLogger.log(TAG, "Watchdog tick=$watchdogTick: LC window not visible " +
+                    // Log every 20 watchdog ticks
+                    if (watchdogTick % 20 == 0L) {
+                        CaptionLogger.log(TAG, "Watchdog tick=$watchdogTick: readWindow=null " +
                             "captionVisible=$captionWasVisible rawLen=${lastRawCaption.length} " +
                             "queueSize=${translateQueue.size}")
                     }
@@ -224,8 +224,10 @@ class LiveCaptionReader : AccessibilityService() {
             .filter  { !isStaticUiLabel(it) }
             .maxByOrNull { it.length }
             ?.trim() ?: run {
-                if (captionWasVisible)
-                    CaptionLogger.log(TAG, "LC window visible but no valid text nodes (${nodes.size} raw nodes)")
+                // Log actual content of every raw node to diagnose filter failures
+                val rawSample = nodes.joinToString(" | ") { "'${it.take(60)}'" }
+                CaptionLogger.log(TAG, "No valid nodes (${nodes.size}): [$rawSample] " +
+                    "captionVisible=$captionWasVisible rawLen=${lastRawCaption.length}")
                 return null
             }
 
@@ -398,6 +400,9 @@ class LiveCaptionReader : AccessibilityService() {
         node ?: return
         val text = node.text?.toString()?.trim() ?: ""
         if (text.isNotBlank()) out.add(text)
+        // Also check contentDescription — LC sometimes puts text here
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        if (desc.isNotBlank() && desc != text) out.add(desc)
         for (i in 0 until node.childCount) collectAllText(node.getChild(i), out)
     }
 
