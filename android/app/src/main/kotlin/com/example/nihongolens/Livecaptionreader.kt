@@ -30,8 +30,8 @@ class LiveCaptionReader : AccessibilityService() {
     companion object {
         private const val TAG              = "LCReader"
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
-        private const val CONNECT_TIMEOUT  = 2_000
-        private const val READ_TIMEOUT     = 12_000
+        private const val CONNECT_TIMEOUT  = 3_000
+        private const val READ_TIMEOUT     = 30_000
         private const val DEBOUNCE_MS      = 500L
         private const val MAX_WAIT_MS      = 3_000L
         private const val WATCHDOG_MS      = 1_500L
@@ -206,11 +206,12 @@ class LiveCaptionReader : AccessibilityService() {
                 captionWasVisible  = false
                 lastRawCaption     = ""
                 lastSentText2      = ""
-                // Discard stale backlog — don't translate sentences from a video
-                // that already stopped playing
+                // Clear dedup so next LC session enqueues fresh content immediately
+                lastEnqueuedNorm   = ""
+                lastSentText       = ""
                 val dropped = translateQueue.size
                 translateQueue.clear()
-                expectedSeq = seqCounter.get() + 1   // skip any in-flight items
+                expectedSeq = seqCounter.get() + 1
                 pendingJob?.cancel(); pendingJob = null
                 forceJob?.cancel();   forceJob   = null
                 if (dropped > 0) CaptionLogger.log(TAG, "LC gone → dropped $dropped (expectedSeq=$expectedSeq)")
