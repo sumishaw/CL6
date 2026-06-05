@@ -15,13 +15,13 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * LiveCaptionReader — reads Live Captions → translates → OverlayService
  *
- * Tuned for whisper_server.py with beam_size=3, semaphore timeout=15s:
- *  - CONNECT_TIMEOUT = 3s
- *  - READ_TIMEOUT    = 20s  (< semaphore 15s + CT2 time, but server responds within 15s)
- *  - DEBOUNCE_MS     = 250ms (fast response to new captions)
- *  - MAX_WAIT_MS     = 1500ms (don't wait long — LC updates fast)
- *  - Queue cap = 3  (keep translations current, discard stale backlog)
- *  - FIFO + sequence tokens — no drops, no duplicates, no stale items
+ * Architecture:
+ *  - Events + watchdog feed into schedule() → debounce 300ms → enqueue()
+ *  - enqueue() has 3-level dedup: exact / tail-80 / minor-grow-15ch
+ *  - FIFO queue with sequence tokens — no stale translations after LC gone
+ *  - Single force-job: fires MAX_WAIT_MS after last event, then self-cancels
+ *  - Queue cap 3: keeps translations current, drops oldest when backlogged
+ *  - Hindi output dedup: same result within 8s is skipped
  */
 class LiveCaptionReader : AccessibilityService() {
 
@@ -29,13 +29,15 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TAG              = "LCReader"
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT  = 3_000
-        private const val READ_TIMEOUT     = 35_000  // LibreTranslate can take 10-15s on tablet CPU
-        private const val DEBOUNCE_MS      = 250L
-        private const val MAX_WAIT_MS      = 1_500L
-        private const val WATCHDOG_MS      = 1_500L
+        private const val READ_TIMEOUT     = 35_000
+        private const val DEBOUNCE_MS      = 300L
+        private const val MAX_WAIT_MS      = 2_000L
+        private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
         private const val QUEUE_CAP        = 3
+        private const val MIN_ENQUEUE_LEN  = 8   // minimum chars to bother translating
+        private const val MIN_GROW_CHARS   = 15  // minimum new chars before re-enqueue
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -47,37 +49,40 @@ class LiveCaptionReader : AccessibilityService() {
         @Volatile var instance: LiveCaptionReader? = null
     }
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var pendingJob:   Job? = null
-    private var forceJob:     Job? = null
-    private var translateJob: Job? = null
-    private var watchdogJob:  Job? = null
+    private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var pendingJob:    Job? = null
+    private var forceJob:      Job? = null
+    private var translateJob:  Job? = null
+    private var watchdogJob:   Job? = null
 
-    // FIFO translation queue with sequence tokens
+    // FIFO + sequence tokens
     private val queue      = LinkedBlockingQueue<Pair<Long, String>>()
     private val seqCounter = AtomicLong(0)
     @Volatile private var expectedSeq = 0L
 
-    // Dedup state
-    private var lastNorm      = ""
-    private var lastSentText  = ""
+    // Dedup
+    private var lastNorm         = ""
+    private var lastEnqueuedFull = ""
+    private var lastHindiOut     = ""
+    private var lastHindiTime    = 0L
+    private val HINDI_DEDUP_MS   = 6_000L
 
-    // Language confirmation (prevents oscillation on mixed-script text)
-    private var confirmedLang  = ""
-    private var pendingLang    = ""
-    private var pendingCount   = 0
+    // Language confirmation
+    private var confirmedLang = ""
+    private var pendingLang   = ""
+    private var pendingCount  = 0
 
     // Window state
-    private var lastRaw        = ""
-    private var lastFull       = ""
-    private var lcVisible      = false
-    private var startupTime    = 0L
+    private var lastRaw     = ""
+    private var lastFull    = ""
+    private var lcVisible   = false
+    private var startupTime = 0L
 
     // Stats
-    private val evtCount  = AtomicLong(0)
-    private val enqCount  = AtomicLong(0)
-    private val okCount   = AtomicLong(0)
-    private val errCount  = AtomicLong(0)
+    private val evtCount = AtomicLong(0)
+    private val enqCount = AtomicLong(0)
+    private val okCount  = AtomicLong(0)
+    private val errCount = AtomicLong(0)
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -92,7 +97,7 @@ class LiveCaptionReader : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED)
             it.feedbackType        = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            it.notificationTimeout = 50
+            it.notificationTimeout = 100
             it.flags = (AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS)
             it.packageNames = null
@@ -128,7 +133,6 @@ class LiveCaptionReader : AccessibilityService() {
         if (System.currentTimeMillis() - startupTime < STARTUP_GRACE_MS) return
         evtCount.incrementAndGet()
         val text = readWindow() ?: return
-        CaptionLogger.log(TAG, "EV '${text.take(60)}'")
         schedule(text)
     }
 
@@ -142,13 +146,21 @@ class LiveCaptionReader : AccessibilityService() {
                 if (System.currentTimeMillis() - startupTime < STARTUP_GRACE_MS) continue
                 tick++
                 val text = withContext(Dispatchers.Main) {
-                    try { readWindow() } catch (e: Exception) { null }
+                    try { readWindow() } catch (_: Exception) { null }
                 } ?: run {
                     if (tick % 20L == 0L)
                         CaptionLogger.log(TAG, "WD null tick=$tick vis=$lcVisible")
                     return@run null
                 } ?: continue
-                if (norm(text) == lastNorm) continue
+
+                // Watchdog uses same dedup — only schedule if meaningfully new
+                val n = norm(text)
+                if (n == lastNorm) continue
+                val tail     = if (n.length > 80) n.takeLast(80) else n
+                val lastTail = if (lastNorm.length > 80) lastNorm.takeLast(80) else lastNorm
+                if (tail == lastTail) continue
+
+                CaptionLogger.log(TAG, "WD new text tick=$tick")
                 schedule(text)
             }
         }
@@ -170,7 +182,7 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Window reader ─────────────────────────────────────────────────────────
 
     private fun readWindow(): String? {
-        val wins = try { windows } catch (e: Exception) { return null }
+        val wins = try { windows } catch (_: Exception) { return null }
 
         var root: AccessibilityNodeInfo? = null
         wins?.forEach { w ->
@@ -181,16 +193,17 @@ class LiveCaptionReader : AccessibilityService() {
 
         if (root == null) {
             if (lcVisible) {
-                lcVisible = false; lastRaw = ""; lastFull = ""
-                lastNorm = ""; lastSentText = ""
-                lastHindiOut = ""; lastHindiTime = 0L; lastEnqueuedFull = ""
+                lcVisible = false
+                lastRaw = ""; lastFull = ""
+                lastNorm = ""; lastEnqueuedFull = ""
+                lastHindiOut = ""; lastHindiTime = 0L
                 val dropped = queue.size
                 queue.clear()
                 expectedSeq = seqCounter.get() + 1
                 pendingJob?.cancel(); pendingJob = null
                 forceJob?.cancel();   forceJob   = null
-                if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped seq=$expectedSeq")
-                else CaptionLogger.log(TAG, "LC gone")
+                if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped")
+                else              CaptionLogger.log(TAG, "LC gone")
                 OverlayService.clearQueue()
             }
             return null
@@ -230,71 +243,67 @@ class LiveCaptionReader : AccessibilityService() {
     private fun norm(t: String) = t.trim().replace(Regex("\\s+"), " ")
 
     private fun schedule(text: String) {
-        // Language confirmation with dominant-script counting
+        // Language switch detection
         val script = detectScript(text)
         if (script != confirmedLang) {
             if (script == pendingLang) {
                 if (++pendingCount >= LANG_CONFIRM) {
                     CaptionLogger.log(TAG, "LANG $confirmedLang→$script")
                     confirmedLang = script; pendingLang = ""; pendingCount = 0
-                    lastNorm = ""; lastSentText = ""; lastRaw = ""; lastFull = ""
+                    lastNorm = ""; lastEnqueuedFull = ""; lastFull = ""; lastRaw = ""
                     queue.clear(); expectedSeq = seqCounter.get() + 1
                 }
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
 
+        // Debounce: restart 300ms timer on every new event
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
             enqueue(lastFull.ifBlank { text })
         }
 
+        // Force-send: one timer only, fires MAX_WAIT_MS after first unhandled event
+        // Self-cancels after firing to prevent stacking
         if (forceJob == null || forceJob?.isActive == false) {
             forceJob = scope.launch {
                 delay(MAX_WAIT_MS)
-                pendingJob?.cancel()
+                forceJob = null
+                pendingJob?.cancel(); pendingJob = null
                 enqueue(lastFull.ifBlank { text })
             }
         }
     }
 
-    private var lastEnqueuedFull = ""  // full text that was last enqueued
-    private var lastHindiOut     = ""
-    private var lastHindiTime    = 0L
-    private val HINDI_DEDUP_MS   = 8_000L  // don't show same Hindi within 8s
-
     private fun enqueue(text: String) {
-        forceJob?.cancel(); forceJob = null
-        if (text.isBlank()) return
+        if (text.isBlank() || text.length < MIN_ENQUEUE_LEN) return
 
         val n = norm(text)
 
-        // Primary dedup: exact normalized match
+        // Level 1: exact match
         if (n == lastNorm) return
 
-        // Tail dedup: last 80 chars identical → same content, just more accumulated prefix
+        // Level 2: tail-80 match (LC accumulates — same tail = same content)
         val tail     = if (n.length > 80) n.takeLast(80) else n
         val lastTail = if (lastNorm.length > 80) lastNorm.takeLast(80) else lastNorm
         if (tail == lastTail) return
 
-        // Content growth check: if this is just the accumulated LC window growing
-        // by a few chars, don't re-translate. Require at least 15 new meaningful chars
-        // OR a non-append (new sentence / scene change)
-        val isAppend = n.length > lastEnqueuedFull.length &&
-            n.startsWith(lastEnqueuedFull.take(lastEnqueuedFull.length.coerceAtMost(n.length - 10)))
-        if (isAppend) {
-            val newChars = n.length - lastEnqueuedFull.length
-            if (newChars < 15) {
-                CaptionLogger.log(TAG, "SKIP minor grow +${newChars}ch")
-                return
-            }
+        // Level 3: minor growth gate — require 15 new meaningful chars
+        // Cancel force-job too so it doesn't retry the same minor-grow text
+        val isAppend = lastEnqueuedFull.isNotEmpty() &&
+            n.length > lastEnqueuedFull.length &&
+            n.startsWith(lastEnqueuedFull.take(lastEnqueuedFull.length.coerceAtMost(n.length - 5)))
+        if (isAppend && (n.length - lastEnqueuedFull.length) < MIN_GROW_CHARS) {
+            CaptionLogger.log(TAG, "SKIP grow +${n.length - lastEnqueuedFull.length}ch")
+            forceJob?.cancel(); forceJob = null   // don't retry same minor-grow
+            return
         }
 
         lastNorm         = n
-        lastSentText     = text
         lastEnqueuedFull = n
         val seq          = seqCounter.incrementAndGet()
 
+        // Cap: drop oldest when backlogged
         while (queue.size >= QUEUE_CAP) queue.poll()
         queue.offer(Pair(seq, text))
         enqCount.incrementAndGet()
@@ -312,38 +321,33 @@ class LiveCaptionReader : AccessibilityService() {
                 } ?: continue
 
                 val (seq, text) = item
-                if (seq < expectedSeq) {
-                    CaptionLogger.log(TAG, "STALE seq=$seq"); continue
-                }
+                if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
 
                 val t0    = System.currentTimeMillis()
                 val hindi = callServer(text)
                 val ms    = System.currentTimeMillis() - t0
 
-                if (seq < expectedSeq) {
-                    CaptionLogger.log(TAG, "DISCARD seq=$seq after ${ms}ms"); continue
-                }
+                if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
 
                 if (hindi.isNullOrBlank()) {
                     errCount.incrementAndGet()
-                    CaptionLogger.log(TAG, "ERR ${ms}ms seq=$seq '${text.take(40)}'")
+                    CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
                     if (norm(text) == lastNorm) lastNorm = ""
                     continue
                 }
 
-                // Dedup Hindi output — profanity sentences often produce the same
-                // Hindi result from slightly different LC accumulated text
-                val hindiNorm = norm(hindi)
-                val now = System.currentTimeMillis()
-                if (hindiNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
-                    CaptionLogger.log(TAG, "SKIP same Hindi within ${HINDI_DEDUP_MS}ms")
+                // Hindi output dedup — same result within HINDI_DEDUP_MS = skip
+                val hNorm = norm(hindi)
+                val now   = System.currentTimeMillis()
+                if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
+                    CaptionLogger.log(TAG, "SKIP dup Hindi ${ms}ms")
                     continue
                 }
                 lastHindiOut  = hindi
                 lastHindiTime = now
 
                 okCount.incrementAndGet()
-                CaptionLogger.log(TAG, "OK seq=$seq ${ms}ms '${hindi.take(50)}'")
+                CaptionLogger.log(TAG, "OK $seq ${ms}ms '${hindi.take(50)}'")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
                 withContext(Dispatchers.Main) {
@@ -355,8 +359,7 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun callServer(text: String): String? {
-        // Don't send very short texts — not enough content to translate meaningfully
-        if (text.trim().length < 4) return null
+        if (text.trim().length < MIN_ENQUEUE_LEN) return null
         var conn: HttpURLConnection? = null
         return try {
             conn = URL(TRANSLATE_URL).openConnection() as HttpURLConnection
@@ -367,7 +370,9 @@ class LiveCaptionReader : AccessibilityService() {
             conn.readTimeout    = READ_TIMEOUT
             val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode != 200) { CaptionLogger.log(TAG, "HTTP ${conn.responseCode}"); return null }
+            if (conn.responseCode != 200) {
+                CaptionLogger.log(TAG, "HTTP ${conn.responseCode}"); return null
+            }
             JSONObject(conn.inputStream.bufferedReader().readText())
                 .optString("text", "").trim().takeIf { it.isNotBlank() }
         } catch (e: Exception) {
@@ -380,10 +385,10 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun resetAll() {
-        lastNorm = ""; lastSentText = ""; confirmedLang = ""
+        lastNorm = ""; lastEnqueuedFull = ""; confirmedLang = ""
         pendingLang = ""; pendingCount = 0
         lastRaw = ""; lastFull = ""; lcVisible = false; expectedSeq = 0L
-        lastHindiOut = ""; lastHindiTime = 0L; lastEnqueuedFull = ""
+        lastHindiOut = ""; lastHindiTime = 0L
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
         SpeechCaptureService.latestOriginal = ""
@@ -392,8 +397,8 @@ class LiveCaptionReader : AccessibilityService() {
     private fun collectText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
         node ?: return
         node.text?.toString()?.trim()?.takeIf { it.isNotBlank() }?.let { out.add(it) }
-        node.contentDescription?.toString()?.trim()?.takeIf { it.isNotBlank() && it != out.lastOrNull() }
-            ?.let { out.add(it) }
+        node.contentDescription?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() && it != out.lastOrNull() }?.let { out.add(it) }
         for (i in 0 until node.childCount) collectText(node.getChild(i), out)
     }
 
@@ -418,23 +423,17 @@ class LiveCaptionReader : AccessibilityService() {
     private fun detectScript(text: String): String {
         var ja = 0; var zh = 0; var ko = 0; var ar = 0; var ru = 0; var hi = 0
         for (c in text) when (c.code) {
-            in 0x3040..0x30FF -> ja++   // Hiragana + Katakana
-            in 0x4E00..0x9FFF -> zh++   // CJK Unified
-            in 0xAC00..0xD7AF -> ko++   // Hangul
-            in 0x0600..0x06FF -> ar++   // Arabic
-            in 0x0400..0x04FF -> ru++   // Cyrillic
-            in 0x0900..0x097F -> hi++   // Devanagari
+            in 0x3040..0x30FF -> ja++
+            in 0x4E00..0x9FFF -> zh++
+            in 0xAC00..0xD7AF -> ko++
+            in 0x0600..0x06FF -> ar++
+            in 0x0400..0x04FF -> ru++
+            in 0x0900..0x097F -> hi++
         }
-        // If ANY CJK/non-Latin script characters present, use that script
-        // Never let English words in a Japanese sentence flip detection to Latin
         val nonLatin = maxOf(ja, zh, ko, ar, ru, hi)
-        if (nonLatin > 0) {
-            return when (nonLatin) {
-                ja -> "ja"; ko -> "ko"; hi -> "hi"
-                ar -> "ar"; ru -> "ru"; else -> "zh"
-            }
+        if (nonLatin > 0) return when (nonLatin) {
+            ja -> "ja"; ko -> "ko"; hi -> "hi"; ar -> "ar"; ru -> "ru"; else -> "zh"
         }
-        // Pure Latin — check for accented chars (European languages)
         return if (text.any { it.isLetter() && it.code in 0x00C0..0x024F })
             "latin_foreign" else "latin_en"
     }
