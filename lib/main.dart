@@ -567,6 +567,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _buildSubtitleSpeedSlider() {
     final presets = [
+      {'label': 'Live',    'seconds': 0.0},
       {'label': 'Fastest', 'seconds': 2.0},
       {'label': 'Fast',    'seconds': 4.0},
       {'label': 'Average', 'seconds': 6.0},
@@ -614,7 +615,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             fontWeight: FontWeight.bold,
                           )),
                       const SizedBox(height: 2),
-                      Text('${secs.toInt()}s',
+                      Text('${secs == 0.0 ? "⚡" : "${secs.toInt()}s"}',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: selected ? Colors.white70 : Colors.white24,
