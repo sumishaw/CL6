@@ -119,7 +119,6 @@ class OverlayService : Service() {
         if (hindi.isBlank()) return
 
         // Speak aloud if TTS enabled
-        HindiTtsService.speak(hindi)
 
         // LIVE mode: show immediately, no queue, no animation
         if (holdMs == 0L) {
