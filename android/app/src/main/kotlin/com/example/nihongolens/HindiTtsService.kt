@@ -5,16 +5,13 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.*
-import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import kotlin.math.sqrt
 
 /**
  * HindiTtsService
@@ -88,16 +85,11 @@ object HindiTtsService {
 
     fun speak(hindiText: String) {
         if (!enabled || hindiText.isBlank()) return
-
-        // Cancel previous utterance
         stopCurrent()
 
-        val gender   = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
-        val emotion  = detectEmotion(hindiText)
-        val speakerId = if (gender == Gender.FEMALE) 1 else 0
-
-        // Speed and pitch based on emotion
+        val emotion    = detectEmotion(hindiText)
         val (speed, _) = emotionParams(emotion)
+        val speakerId  = 0  // rohan model has only 1 speaker (sid=0)
 
         speakJob = scope.launch {
             try {
@@ -106,10 +98,10 @@ object HindiTtsService {
                 if (wavBytes != null && wavBytes.size > 44) {
                     playWav(wavBytes)
                 } else {
-                    Log.w(TAG, "Empty TTS response — is sherpa-onnx server running on :8766?")
+                    Log.w(TAG, "Empty TTS — is hindi_tts_server.py running on :8766?")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "TTS error: ${e.message}")
+                Log.e(TAG, "TTS speak error: ${e.message}")
             } finally {
                 isSpeaking = false
             }
@@ -196,50 +188,34 @@ object HindiTtsService {
     // ── WAV playback ──────────────────────────────────────────────────────────
 
     private suspend fun playWav(wavBytes: ByteArray) = withContext(Dispatchers.IO) {
-        // Parse WAV header to get sample rate and channel info
-        // WAV header: 44 bytes standard
-        val sampleRate  = readInt(wavBytes, 24)
-        val numChannels = readShort(wavBytes, 22)
-        val bitDepth    = readShort(wavBytes, 34)
-        val pcmData     = wavBytes.copyOfRange(44, wavBytes.size)
+        try {
+            // Write WAV to temp file — MediaPlayer is most reliable from a Service context
+            val tmp = java.io.File.createTempFile("tts_", ".wav",
+                android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS) ?: java.io.File("/data/local/tmp"))
+            tmp.writeBytes(wavBytes)
 
-        val audioFormat = if (bitDepth == 16) AudioFormat.ENCODING_PCM_16BIT
-                          else AudioFormat.ENCODING_PCM_8BIT
-        val channelCfg  = if (numChannels == 1) AudioFormat.CHANNEL_OUT_MONO
-                          else AudioFormat.CHANNEL_OUT_STEREO
-
-        val minBuf = AudioTrack.getMinBufferSize(sampleRate, channelCfg, audioFormat)
-        val track  = AudioTrack(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build(),
-            AudioFormat.Builder()
-                .setSampleRate(sampleRate)
-                .setChannelMask(channelCfg)
-                .setEncoding(audioFormat)
-                .build(),
-            maxOf(minBuf, pcmData.size),
-            AudioTrack.MODE_STATIC,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        track.write(pcmData, 0, pcmData.size)
-        track.play()
-        // Wait for playback to finish
-        val durationMs = (pcmData.size.toLong() * 1000) /
-            (sampleRate * numChannels * (bitDepth / 8))
-        delay(durationMs + 100)
-        track.stop(); track.release()
+            val mp = android.media.MediaPlayer()
+            try {
+                mp.setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build())
+                mp.setDataSource(tmp.absolutePath)
+                mp.prepare()
+                val durationMs = mp.duration.toLong()
+                mp.start()
+                Log.d(TAG, "Playing ${durationMs}ms Hindi TTS from ${tmp.name}")
+                delay(durationMs + 300)
+                mp.stop()
+            } finally {
+                try { mp.release() } catch (_: Exception) {}
+                try { tmp.delete() } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "playWav error: ${e.message}")
+        }
     }
-
-    private fun readInt(b: ByteArray, offset: Int)  =
-        ((b[offset+3].toInt() and 0xFF) shl 24) or
-        ((b[offset+2].toInt() and 0xFF) shl 16) or
-        ((b[offset+1].toInt() and 0xFF) shl 8)  or
-        (b[offset].toInt() and 0xFF)
-
-    private fun readShort(b: ByteArray, offset: Int) =
-        (((b[offset+1].toInt() and 0xFF) shl 8) or (b[offset].toInt() and 0xFF))
 
     private fun stopCurrent() {
         speakJob?.cancel(); speakJob = null; isSpeaking = false
