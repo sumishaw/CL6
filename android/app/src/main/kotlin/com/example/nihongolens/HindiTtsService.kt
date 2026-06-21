@@ -53,8 +53,9 @@ object HindiTtsService {
     @JvmField @Volatile var enabled        = false
     @JvmField @Volatile var selectedGender = Gender.AUTO
 
-    @Volatile private var detectedGender = Gender.MALE
-    @Volatile private var isSpeaking     = false
+    @Volatile private var detectedGender    = Gender.MALE
+    @Volatile var isSpeaking                = false   // public — read by LiveCaptionReader
+    @Volatile private var speakingUntilMs   = 0L      // grace period after speech ends
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var pitchDetector: PitchDetector? = null
@@ -117,6 +118,9 @@ object HindiTtsService {
                     val wavBytes = requestTts(text, 0, speed)
                     if (wavBytes != null && wavBytes.size > 44) {
                         playWav(wavBytes)
+                        // Grace period: LC may have buffered TTS audio for 1-2s after playback ends
+                        // Block enqueue during this window to prevent loop tail
+                        speakingUntilMs = System.currentTimeMillis() + 2_000L
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Worker error: ${e.message}")
@@ -125,6 +129,13 @@ object HindiTtsService {
                 }
             }
         }
+    }
+
+    // Called by LiveCaptionReader to check if it should suppress enqueue
+    fun isSuppressed(): Boolean {
+        if (isSpeaking) return true
+        if (System.currentTimeMillis() < speakingUntilMs) return true
+        return false
     }
 
     // ── Emotion detection ─────────────────────────────────────────────────────
@@ -313,6 +324,9 @@ class PitchDetector(private val onGender: (HindiTtsService.Gender) -> Unit) {
                 while (isActive) {
                     val read = rec.read(buf, 0, BUFFER_FRAMES)
                     if (read <= 0) { delay(50); continue }
+
+                    // Skip pitch analysis while TTS is speaking — we'd detect our own voice
+                    if (HindiTtsService.isSuppressed()) { delay(100); continue }
                     val rms = sqrt(buf.take(read).sumOf { it.toLong() * it }.toDouble() / read)
                     if (rms < 200) { delay(20); continue }
                     var zc = 0
