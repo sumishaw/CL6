@@ -369,10 +369,18 @@ class LiveCaptionReader : AccessibilityService() {
                 CaptionLogger.log(TAG, "OK $seq ${ms}ms '${hindi.take(50)}'")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
+
+                // Auto gender detection from source text + language
+                if (HindiTtsService.selectedGender == HindiTtsService.Gender.AUTO) {
+                    HindiTtsService.detectedGender = GenderDetector.detect(text, confirmedLang)
+                }
+
                 withContext(Dispatchers.Main) {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
+                // Speak Hindi translation (non-blocking — queued in background)
+                HindiTtsService.speak(hindi)
             }
         }
     }
