@@ -240,7 +240,9 @@ object HindiTtsService {
 
                 val mp = android.media.MediaPlayer()
                 mp.setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    // USAGE_ASSISTANT: excluded from Live Captions capture
+                    // Live Captions only captures USAGE_MEDIA and USAGE_GAME
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build())
                 mp.setVolume(1.0f, 1.0f)
