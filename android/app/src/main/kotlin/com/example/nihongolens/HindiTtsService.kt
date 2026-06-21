@@ -86,16 +86,17 @@ object HindiTtsService {
 
     fun speak(hindiText: String) {
         if (!enabled || hindiText.isBlank()) return
-        stopCurrent()
+        // Don't cancel previous job — let it finish naturally
+        // Only queue one at a time: if already speaking, skip (subtitle pace handles queuing)
+        if (isSpeaking) return
 
         val emotion    = detectEmotion(hindiText)
         val (speed, _) = emotionParams(emotion)
-        val speakerId  = 0  // rohan model has only 1 speaker (sid=0)
 
         speakJob = scope.launch {
             try {
                 isSpeaking = true
-                val wavBytes = requestTts(hindiText, speakerId, speed)
+                val wavBytes = requestTts(hindiText, 0, speed)
                 if (wavBytes != null && wavBytes.size > 44) {
                     playWav(wavBytes)
                 } else {
@@ -188,38 +189,64 @@ object HindiTtsService {
 
     // ── WAV playback ──────────────────────────────────────────────────────────
 
-    private suspend fun playWav(wavBytes: ByteArray) = withContext(Dispatchers.IO) {
-        try {
-            // Write WAV to temp file — MediaPlayer is most reliable from a Service context
-            val tmp = java.io.File.createTempFile("tts_", ".wav",
-                android.os.Environment.getExternalStoragePublicDirectory(
-                    android.os.Environment.DIRECTORY_DOWNLOADS) ?: java.io.File("/data/local/tmp"))
-            tmp.writeBytes(wavBytes)
+    private var mediaPlayer: android.media.MediaPlayer? = null
 
-            val mp = android.media.MediaPlayer()
+    private suspend fun playWav(wavBytes: ByteArray) {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        withContext(Dispatchers.Main) {
             try {
+                mediaPlayer?.let { try { it.release() } catch (_: Exception) {} }
+                mediaPlayer = null
+
+                val mp = android.media.MediaPlayer()
                 mp.setAudioAttributes(AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build())
-                mp.setDataSource(tmp.absolutePath)
+                mp.setVolume(1.0f, 1.0f)
+
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    mp.setDataSource(ByteArrayMediaDataSource(wavBytes))
+                } else {
+                    val tmp = java.io.File("/data/local/tmp/tts_hindi.wav")
+                    tmp.parentFile?.mkdirs()
+                    tmp.writeBytes(wavBytes)
+                    mp.setDataSource(tmp.absolutePath)
+                }
+
+                mp.setOnCompletionListener {
+                    Log.d(TAG, "TTS playback complete")
+                    try { it.release() } catch (_: Exception) {}
+                    mediaPlayer = null
+                    latch.countDown()
+                }
+                mp.setOnErrorListener { it, what, extra ->
+                    Log.e(TAG, "MediaPlayer error what=$what extra=$extra")
+                    try { it.release() } catch (_: Exception) {}
+                    mediaPlayer = null
+                    latch.countDown()
+                    true
+                }
                 mp.prepare()
-                val durationMs = mp.duration.toLong()
                 mp.start()
-                Log.d(TAG, "Playing ${durationMs}ms Hindi TTS from ${tmp.name}")
-                delay(durationMs + 300)
-                mp.stop()
-            } finally {
-                try { mp.release() } catch (_: Exception) {}
-                try { tmp.delete() } catch (_: Exception) {}
+                mediaPlayer = mp
+                Log.d(TAG, "TTS started: ${mp.duration}ms")
+            } catch (e: Exception) {
+                Log.e(TAG, "playWav setup: ${e.message}")
+                latch.countDown()
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "playWav error: ${e.message}")
+        }
+        // Block IO thread until playback completes (max 30s)
+        withContext(Dispatchers.IO) {
+            latch.await(30, java.util.concurrent.TimeUnit.SECONDS)
         }
     }
 
-    private fun stopCurrent() {
+    fun stopCurrent() {
         speakJob?.cancel(); speakJob = null; isSpeaking = false
+        try { mediaPlayer?.stop() } catch (_: Exception) {}
+        try { mediaPlayer?.release() } catch (_: Exception) {}
+        mediaPlayer = null
     }
 }
 
@@ -276,4 +303,19 @@ class PitchDetector(private val onGender: (HindiTtsService.Gender) -> Unit) {
     }
 
     fun stop() { job?.cancel(); job = null; history.clear() }
+}
+
+// Allows MediaPlayer to read WAV from memory — no temp file conflicts
+@androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.M)
+class ByteArrayMediaDataSource(private val data: ByteArray) :
+    android.media.MediaDataSource() {
+    override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+        if (position >= data.size) return -1
+        val end = minOf(position + size, data.size.toLong()).toInt()
+        val len = (end - position.toInt()).coerceAtLeast(0)
+        System.arraycopy(data, position.toInt(), buffer, offset, len)
+        return len
+    }
+    override fun getSize() = data.size.toLong()
+    override fun close() {}
 }
