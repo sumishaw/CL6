@@ -11,20 +11,28 @@ import android.util.TypedValue
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * OverlayService — Hindi subtitle overlay with speed control
+ * OverlayService — Hindi subtitle overlay with dedicated FIFO backlog
  *
- * Speed modes (holdMs):
- *   0    = Live   — instant display, mirrors UI subtitle exactly
- *   2000 = Fastest
- *   4000 = Fast
- *   6000 = Average  (default)
- *   8000 = Slow
- *  10000 = Slowest
+ * FIFO backlog (unbounded LinkedBlockingQueue):
+ *   - Every translation is enqueued — nothing is ever dropped
+ *   - Items displayed in order at holdMs pace
+ *   - Token system: LC going away (onClear) advances expectedToken,
+ *     draining stale items silently
  *
- * FIFO + token — no dropping, no stale display after LC gone.
+ * Speed modes (holdMs set via setHoldMs):
+ *   0     = Live   — show instantly, no hold, no word-by-word
+ *   2000  = Fastest
+ *   4000  = Fast
+ *   6000  = Average (default)
+ *   8000  = Slow
+ *   10000 = Slowest
+ *
+ * Word-by-word: words appear at msPerWord = holdMs*0.5/totalWords
+ * so sentence fills in first half of hold period, second half is reading time.
  */
 class OverlayService : Service() {
 
@@ -32,8 +40,7 @@ class OverlayService : Service() {
         const val CHANNEL_ID = "nihongo_overlay"
         const val NOTIF_ID   = 1
 
-        // holdMs lives in companion — written by setHoldMs, read by service instance
-        @Volatile @JvmField var holdMs: Long = 6_000L   // default: Average
+        @Volatile @JvmField var holdMs: Long = 6_000L
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
@@ -41,37 +48,33 @@ class OverlayService : Service() {
         @Volatile private var instance: OverlayService? = null
 
         fun updateText(original: String, hindi: String) {
-            latestOriginal = original
-            latestHindi    = hindi
+            latestOriginal = original; latestHindi = hindi
             instance?.handler?.post { instance?.onNewHindi(hindi) }
         }
-
         fun clearQueue() {
             instance?.handler?.post { instance?.onClear() }
         }
-
         fun setHoldMs(ms: Long) {
-            val clamped = ms.coerceIn(0, 15_000)
-            holdMs = clamped
-            if (clamped == 0L) {
-                instance?.handler?.post { instance?.switchToLive() }
-            }
+            val v = ms.coerceIn(0, 15_000)
+            holdMs = v
+            if (v == 0L) instance?.handler?.post { instance?.switchToLive() }
         }
     }
 
-    private val handler = Handler(Looper.getMainLooper())
-
-    // FIFO queue with tokens
+    // ── FIFO backlog — unbounded, never drops sentences ───────────────────────
     private val tokenCounter  = AtomicLong(0)
     @Volatile private var expectedToken = 0L
+
     data class Item(val token: Long, val text: String)
-    private val queue = ArrayDeque<Item>()
+    private val backlog = LinkedBlockingQueue<Item>()  // FIFO, unbounded
 
     // Display state (main thread only)
     private var active       = false
     private var wordRunnable: Runnable? = null
     private var holdRunnable: Runnable? = null
     private var silenceRunnable: Runnable? = null
+
+    val handler = Handler(Looper.getMainLooper())
 
     // Views
     private var windowManager: WindowManager?              = null
@@ -105,7 +108,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         alive = false; instance = null
         handler.removeCallbacksAndMessages(null)
-        queue.clear()
+        backlog.clear()
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
@@ -113,43 +116,37 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── New translation arrived ───────────────────────────────────────────────
+    // ── New translation ───────────────────────────────────────────────────────
 
     private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
+        val token = tokenCounter.incrementAndGet()
 
-        // Speak aloud if TTS enabled
-
-        // LIVE mode: show immediately, no queue, no animation
         if (holdMs == 0L) {
-            cancelTimers()
-            active = false
-            queue.clear()
+            // Live mode — show instantly, don't queue
+            cancelTimers(); active = false; backlog.clear()
             setTextDirect(hindi.trim())
             reschedSilence()
             return
         }
 
-        // Timed modes: FIFO queue
-        val token = tokenCounter.incrementAndGet()
-        queue.addLast(Item(token, hindi.trim()))
+        // Timed mode — enqueue in FIFO backlog
+        backlog.offer(Item(token, hindi.trim()))
         reschedSilence()
         if (!active) advance()
     }
 
     private fun onClear() {
+        // Invalidate pending tokens — stale items drained silently in advance()
         expectedToken = tokenCounter.get() + 1
-        queue.clear()
+        backlog.clear()
         cancelTimers()
         active = false
         fadeOut()
     }
 
-    // Called when user switches TO live while something is showing
     private fun switchToLive() {
-        cancelTimers()
-        active = false
-        queue.clear()
+        cancelTimers(); active = false; backlog.clear()
     }
 
     // ── Display loop ──────────────────────────────────────────────────────────
@@ -158,10 +155,13 @@ class OverlayService : Service() {
         cancelTimers()
 
         // Drain stale tokens
-        while (queue.isNotEmpty() && queue.first().token < expectedToken)
-            queue.removeFirst()
+        while (true) {
+            val head = backlog.peek() ?: break
+            if (head.token >= expectedToken) break
+            backlog.poll()
+        }
 
-        val item = queue.removeFirstOrNull() ?: run { active = false; return }
+        val item = backlog.poll() ?: run { active = false; return }
         if (item.token < expectedToken) { advance(); return }
 
         active = true
@@ -176,20 +176,20 @@ class OverlayService : Service() {
             if (holdMs == 0L) { active = false; return }
 
             if (index >= words.size) {
-                // All words shown — hold for remaining read time then advance
-                // Read holdMs fresh here so speed changes take effect immediately
+                // All words shown — hold remaining read time then advance to next
                 val currentHold = holdMs
-                val elapsed     = ((currentHold * 0.6) / totalWords * totalWords).toLong()
-                val holdTime    = (currentHold - elapsed).coerceIn(300L, currentHold)
+                val fillTime    = ((currentHold * 0.55) / totalWords * totalWords).toLong()
+                val remaining   = (currentHold - fillTime).coerceIn(500L, currentHold)
                 holdRunnable = Runnable {
                     holdRunnable = null
                     if (!alive) return@Runnable
-                    if (item.token < expectedToken) { active = false; fadeOut(); return@Runnable }
+                    if (item.token < expectedToken) { active = false; fadeOut(); advance(); return@Runnable }
                     fadeOut()
                     active = false
-                    if (queue.isNotEmpty()) handler.postDelayed({ advance() }, 100)
+                    // Brief gap between sentences for visual breathing room
+                    handler.postDelayed({ if (alive) advance() }, 80)
                 }
-                handler.postDelayed(holdRunnable!!, holdTime)
+                handler.postDelayed(holdRunnable!!, remaining)
                 return
             }
 
@@ -197,8 +197,8 @@ class OverlayService : Service() {
             index++
             setTextDirect(built)
 
-            // msPerWord: read holdMs fresh each tick so speed changes take immediate effect
-            val msPerWord = ((holdMs * 0.6) / totalWords).toLong().coerceIn(60, 450)
+            // Read holdMs fresh every tick — speed changes take effect immediately
+            val msPerWord = ((holdMs * 0.55) / totalWords).toLong().coerceIn(50, 500)
             wordRunnable = Runnable { tick() }
             handler.postDelayed(wordRunnable!!, msPerWord)
         }
@@ -206,7 +206,7 @@ class OverlayService : Service() {
         tick()
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── View helpers ──────────────────────────────────────────────────────────
 
     private fun setTextDirect(text: String) {
         val tv = textView ?: return
@@ -231,10 +231,8 @@ class OverlayService : Service() {
 
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
-        silenceRunnable = Runnable {
-            if (queue.isEmpty() && !active) fadeOut()
-        }
-        handler.postDelayed(silenceRunnable!!, 10_000)
+        silenceRunnable = Runnable { if (backlog.isEmpty() && !active) fadeOut() }
+        handler.postDelayed(silenceRunnable!!, 12_000)
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
@@ -248,7 +246,7 @@ class OverlayService : Service() {
                 setTextColor(Color.WHITE)
                 setShadowLayer(14f, 1f, 3f, Color.BLACK)
                 maxLines   = 2
-                background = null
+                background = null   // no box — text only
                 setPadding(dp(8), dp(4), dp(8), dp(4))
                 alpha = 0f; text = ""
             }
@@ -273,16 +271,14 @@ class OverlayService : Service() {
                     MotionEvent.ACTION_MOVE -> {
                         p.x = ix+(ev.rawX-sx).toInt(); p.y = iy-(ev.rawY-sy).toInt()
                         if (viewAdded) try { windowManager?.updateViewLayout(overlayView,p) }
-                        catch(_:Exception){}
+                        catch (_:Exception){}
                     }
                 }
                 true
             }
             windowManager?.addView(overlayView, params)
             viewAdded = true
-        } catch (e: Exception) {
-            android.util.Log.e("OverlayService","build: ${e.message}")
-        }
+        } catch (e: Exception) { android.util.Log.e("OverlayService","build: ${e.message}") }
     }
 
     private fun createNotificationChannel() {
