@@ -122,11 +122,17 @@ class MainActivity : FlutterActivity() {
                 "startOverlay" -> {
                     val i = Intent(this, OverlayService::class.java)
                     startForegroundServiceCompat(i)
+                    // Mute mic — prevents TTS audio from reaching Live Captions via mic
+                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                    am.isMicrophoneMute = true
                     result.success(true)
                 }
 
                 "stopOverlay" -> {
                     stopService(Intent(this, OverlayService::class.java))
+                    // Restore mic
+                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                    am.isMicrophoneMute = false
                     result.success(true)
                 }
 
