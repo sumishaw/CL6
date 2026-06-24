@@ -65,7 +65,7 @@ object HindiTtsService {
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
 
     // Token dedup — never re-speak same sentence
-    private val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()
+    @JvmField val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()  // accessible from GenderAnalyzer
 
     private var fetchWorker: Job? = null
     private var playWorker:  Job? = null
@@ -132,15 +132,17 @@ object HindiTtsService {
 
         val emotion = detectEmotion(n)
         val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-        val gender  = when (selectedGender) {
+        // Always store "auto" — gender resolved at fetch time so switches apply immediately
+        // even for sentences already in queue
+        val genderTag = when (selectedGender) {
             Gender.FEMALE -> "female"
             Gender.MALE   -> "male"
-            Gender.AUTO   -> if (detectedGender == Gender.FEMALE) "female" else "male"
+            Gender.AUTO   -> "auto"   // resolved in fetchWorker to catch late gender switches
         }
 
         // If fetch queue is backlogged (> 2 items), drop oldest to stay near real-time
         while (fetchQueue.size >= 2) fetchQueue.poll()
-        fetchQueue.offer(FetchItem(n, gender, speed))
+        fetchQueue.offer(FetchItem(n, genderTag, speed))
     }
 
 
@@ -209,7 +211,11 @@ object HindiTtsService {
                 val item = fetchQueue.take()   // blocks — never misses
                 if (!enabled) continue
                 try {
-                    val wav = fetchWav(item.text, item.gender, item.speed)
+                    // Resolve gender at fetch time — captures latest GenderAnalyzer result
+                    val resolvedGender = if (item.gender == "auto")
+                        if (detectedGender == Gender.FEMALE) "female" else "male"
+                    else item.gender
+                    val wav = fetchWav(item.text, resolvedGender, item.speed)
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
