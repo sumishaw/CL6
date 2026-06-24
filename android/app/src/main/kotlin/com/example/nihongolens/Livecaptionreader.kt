@@ -352,7 +352,7 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
             val t = capWords(sentenceBuffer.trim(), 12)
-            if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 3) {
+            if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 2) {
                 CaptionLogger.log(TAG, "SILENCE translate")
                 lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                 enqueue(t); sentenceBuffer = ""
@@ -380,7 +380,7 @@ class LiveCaptionReader : AccessibilityService() {
         // Skip very short texts — single words like "Time.", "Like," are not worth translating
         // They are usually mid-sentence LC accumulation artifacts
         val wordCount = text.trim().split(Regex("\\s+")).size
-        if (wordCount < 4) {
+        if (wordCount < 2) {
             CaptionLogger.log(TAG, "SKIP: too short ($wordCount words)")
             return
         }
