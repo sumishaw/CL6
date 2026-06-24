@@ -287,101 +287,105 @@ object HindiTtsService {
 
     private fun startGenderPoller() {
         genderJob = scope.launch {
-            val SR      = 16_000
-            val SAMPLES = 16_000 * 2  // 2 seconds of audio per sample
-            val minBuf  = AudioRecord.getMinBufferSize(
-                SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-
-            // Try audio sources in order — UNPROCESSED may capture system audio on some devices
-            var rec: AudioRecord? = null
-            for (src in intArrayOf(
-                MediaRecorder.AudioSource.UNPROCESSED,
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC)) {
-                try {
-                    val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, SAMPLES * 2))
-                    if (r.state == AudioRecord.STATE_INITIALIZED) {
-                        rec = r
-                        Log.d(TAG, "AudioRecord started src=$src")
-                        break
-                    }
-                    r.release()
-                } catch (_: Exception) {}
-            }
-
-            if (rec == null) {
-                Log.e(TAG, "AudioRecord init failed — gender detection unavailable")
-                return@launch
-            }
-
-            rec.startRecording()
-            val buf = ShortArray(SAMPLES)
-
+            Log.d(TAG, "Gender detector starting — REMOTE_SUBMIX internal audio")
             while (isActive) {
-                // Skip during TTS — avoid self-detection
-                if (isSuppressed()) { delay(500); continue }
-                if (selectedGender != Gender.AUTO) { delay(2_000); continue }
-
-                // Collect 2s of audio
-                var read = 0
-                while (read < SAMPLES && isActive) {
-                    val n = rec.read(buf, read, SAMPLES - read)
-                    if (n > 0) read += n else break
+                if (selectedGender != Gender.AUTO || isSuppressed()) {
+                    delay(2_000); continue
                 }
-                if (read < SAMPLES / 2) { delay(200); continue }
-
-                // Check RMS — skip silence
-                var sumSq = 0.0
-                for (i in 0 until read) sumSq += buf[i].toLong() * buf[i]
-                val rms = kotlin.math.sqrt(sumSq / read)
-                if (rms < 80) { delay(500); continue }  // silence
-
-                // Convert ShortArray to ByteArray and POST to server
-                val pcmBytes = ByteArray(read * 2)
-                for (i in 0 until read) {
-                    pcmBytes[i * 2]     = (buf[i].toInt() and 0xFF).toByte()
-                    pcmBytes[i * 2 + 1] = (buf[i].toInt() shr 8 and 0xFF).toByte()
-                }
-
                 try {
-                    val conn = URL("http://127.0.0.1:8765/analyze_audio")
-                        .openConnection() as HttpURLConnection
-                    conn.requestMethod  = "POST"
-                    conn.doOutput       = true
-                    conn.connectTimeout = 2_000
-                    conn.readTimeout    = 3_000
-                    conn.setRequestProperty("Content-Type", "application/octet-stream")
-                    conn.setRequestProperty("Content-Length", pcmBytes.size.toString())
-                    conn.outputStream.write(pcmBytes)
-
-                    if (conn.responseCode == 200) {
-                        val json = JSONObject(conn.inputStream.bufferedReader().readText())
-                        val g    = json.optString("gender", "")
-                        val conf = json.optInt("confidence", 0)
-                        if (g == "female" || g == "male") {
-                            val newG = if (g == "female") Gender.FEMALE else Gender.MALE
-                            genderHistory.addLast(newG)
-                            if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
-                            val fCount = genderHistory.count { it == Gender.FEMALE }
-                            val majority = if (fCount > genderHistory.size / 2)
-                                Gender.FEMALE else Gender.MALE
-                            if (majority != detectedGender) {
-                                detectedGender = majority
-                                Log.d(TAG, "Gender → $majority (rms=${rms.toInt()} g=$g conf=$conf)")
-                            }
-                        }
-                    }
-                    conn.disconnect()
+                    sampleAndDetectGender()
                 } catch (e: Exception) {
-                    Log.w(TAG, "Gender POST: ${e.message}")
+                    Log.w(TAG, "Gender sample: ${e.message}")
                 }
-
-                delay(1_500)  // analyze every 1.5s
+                delay(2_000)
             }
-
-            try { rec.stop(); rec.release() } catch (_: Exception) {}
         }
+    }
+
+    private suspend fun sampleAndDetectGender() = withContext(Dispatchers.IO) {
+        val SR      = 16_000
+        val SAMPLES = SR * 2   // 2s
+        val minBuf  = AudioRecord.getMinBufferSize(
+            SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            .coerceAtLeast(SAMPLES * 2)
+
+        // REMOTE_SUBMIX (100) captures internal system audio — same as Live Captions
+        // This is what screen recorders use on Android 10+
+        // Fallback to VOICE_RECOGNITION (mic) if REMOTE_SUBMIX unavailable
+        val sources = listOf(100, MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                             MediaRecorder.AudioSource.MIC)
+        var rec: AudioRecord? = null
+        for (src in sources) {
+            try {
+                val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, minBuf)
+                if (r.state == AudioRecord.STATE_INITIALIZED) {
+                    rec = r
+                    Log.d(TAG, "Gender AudioRecord src=$src")
+                    break
+                }
+                r.release()
+            } catch (_: Exception) {}
+        }
+        val record = rec ?: return@withContext
+
+        val buf = ShortArray(SAMPLES)
+        try {
+            record.startRecording()
+            var read = 0
+            while (read < SAMPLES) {
+                val n = record.read(buf, read, SAMPLES - read)
+                if (n <= 0) break
+                read += n
+            }
+            record.stop()
+        } finally {
+            try { record.release() } catch (_: Exception) {}
+        }
+
+        if (isSuppressed()) return@withContext  // check again after recording
+
+        // RMS check
+        var sq = 0.0
+        for (i in buf.indices) sq += buf[i].toLong() * buf[i]
+        val rms = kotlin.math.sqrt(sq / buf.size)
+        if (rms < 20) return@withContext  // silence
+
+        // Convert to bytes and POST to whisper_server for FFT analysis
+        val pcm = ByteArray(buf.size * 2)
+        for (i in buf.indices) {
+            pcm[i*2]   = (buf[i].toInt() and 0xFF).toByte()
+            pcm[i*2+1] = (buf[i].toInt() shr 8 and 0xFF).toByte()
+        }
+
+        val conn = URL("http://127.0.0.1:8765/analyze_audio")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 2_000
+        conn.readTimeout = 3_000
+        conn.setRequestProperty("Content-Type", "application/octet-stream")
+        conn.outputStream.write(pcm)
+
+        if (conn.responseCode == 200) {
+            val json = JSONObject(conn.inputStream.bufferedReader().readText())
+            val g    = json.optString("gender", "")
+            val conf = json.optInt("confidence", 0)
+            conn.disconnect()
+
+            if (g == "female" || g == "male") {
+                val newG = if (g == "female") Gender.FEMALE else Gender.MALE
+                genderHistory.addLast(newG)
+                if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
+                val fCount = genderHistory.count { it == Gender.FEMALE }
+                val majority = if (fCount > genderHistory.size / 2)
+                    Gender.FEMALE else Gender.MALE
+                if (majority != detectedGender) {
+                    detectedGender = majority
+                    Log.d(TAG, "Gender switched → $majority rms=${rms.toInt()} g=$g conf=$conf")
+                }
+            }
+        } else conn.disconnect()
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
