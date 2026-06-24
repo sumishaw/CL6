@@ -49,34 +49,21 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            // When TTS enabled: subtitle driven by TTS (showTtsText/clearTtsText)
-            // When TTS disabled: subtitle driven by holdMs timer
-            if (!HindiTtsService.enabled) {
-                instance?.handler?.post { instance?.onNewHindi(hindi) }
-            }
+            // Always update subtitle immediately when translation arrives
+            // TTS plays asynchronously — subtitle and TTS run in parallel
+            instance?.handler?.post { instance?.onNewHindi(hindi) }
         }
 
-        // Called by HindiTtsService play worker when WAV starts playing
-        // Shows subtitle for exactly as long as TTS is speaking
+        // Called by TTS play worker — subtitle already showing, just ensure visible
         fun showTtsText(hindi: String) {
-            instance?.handler?.post {
-                val tv = instance?.textView ?: return@post
-                tv.animate().cancel()
-                tv.maxLines = 10   // never truncate — show full sentence
-                tv.alpha = 1f
-                tv.text  = hindi
-            }
+            // No-op: subtitle already shown by updateText above
+            // Kept for future use (e.g. highlight current word)
         }
 
-        // Called by HindiTtsService play worker when WAV finishes
+        // Called by TTS play worker when speech ends
         fun clearTtsText() {
-            instance?.handler?.post {
-                instance?.textView?.animate()?.cancel()
-                instance?.textView?.animate()
-                    ?.alpha(0f)?.setDuration(300)
-                    ?.withEndAction { instance?.textView?.text = "" }
-                    ?.start()
-            }
+            // No-op: subtitle persists until next translation arrives
+            // OverlayService backlog timer handles fade-out via reschedSilence
         }
         fun clearQueue() {
             instance?.handler?.post { instance?.onClear() }
@@ -148,23 +135,12 @@ class OverlayService : Service() {
     private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
         val token = tokenCounter.incrementAndGet()
-
-        if (holdMs == 0L) {
-            // Live mode — show instantly, don't queue
-            cancelTimers(); active = false; backlog.clear()
-            setTextDirect(hindi.trim())
-            reschedSilence()
-            return
-        }
-
-        // Timed mode — enqueue in FIFO backlog
         backlog.offer(Item(token, hindi.trim()))
         reschedSilence()
         if (!active) advance()
     }
 
     private fun onClear() {
-        // Invalidate pending tokens — stale items drained silently in advance()
         expectedToken = tokenCounter.get() + 1
         backlog.clear()
         cancelTimers()
@@ -177,6 +153,7 @@ class OverlayService : Service() {
     }
 
     // ── Display loop ──────────────────────────────────────────────────────────
+    // Shows FULL sentence immediately. Holds until next sentence or holdMs expires.
 
     private fun advance() {
         cancelTimers()
@@ -192,55 +169,37 @@ class OverlayService : Service() {
         if (item.token < expectedToken) { advance(); return }
 
         active = true
-        val words      = item.text.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val totalWords = words.size.coerceAtLeast(1)
-        var index      = 0
-        var built      = ""
 
-        fun tick() {
-            wordRunnable = null
-            if (!alive || item.token < expectedToken) { active = false; fadeOut(); return }
-            if (holdMs == 0L) { active = false; return }
+        // Show FULL sentence immediately — no word-by-word
+        setTextDirect(item.text)
 
-            if (index >= words.size) {
-                // All words shown — hold remaining read time then advance to next
-                val currentHold = holdMs
-                val fillTime    = ((currentHold * 0.55) / totalWords * totalWords).toLong()
-                val remaining   = (currentHold - fillTime).coerceIn(500L, currentHold)
-                holdRunnable = Runnable {
-                    holdRunnable = null
-                    if (!alive) return@Runnable
-                    if (item.token < expectedToken) { active = false; fadeOut(); advance(); return@Runnable }
-                    fadeOut()
-                    active = false
-                    // Brief gap between sentences for visual breathing room
-                    handler.postDelayed({ if (alive) advance() }, 80)
-                }
-                handler.postDelayed(holdRunnable!!, remaining)
-                return
+        // Hold time: use holdMs, or if Live mode (0), just show until next arrives
+        val hold = if (holdMs == 0L) 8_000L else holdMs   // 8s default in Live mode
+
+        holdRunnable = Runnable {
+            holdRunnable = null
+            if (!alive) return@Runnable
+            if (item.token < expectedToken) { active = false; fadeOut(); advance(); return@Runnable }
+            // If more items queued, advance immediately; else fade out
+            if (backlog.isNotEmpty()) {
+                active = false; advance()
+            } else {
+                fadeOut(); active = false
             }
-
-            built = if (built.isEmpty()) words[index] else "$built ${words[index]}"
-            index++
-            setTextDirect(built)
-
-            // Read holdMs fresh every tick — speed changes take effect immediately
-            val msPerWord = ((holdMs * 0.55) / totalWords).toLong().coerceIn(50, 500)
-            wordRunnable = Runnable { tick() }
-            handler.postDelayed(wordRunnable!!, msPerWord)
         }
-
-        tick()
+        handler.postDelayed(holdRunnable!!, hold)
+    }
     }
 
     // ── View helpers ──────────────────────────────────────────────────────────
 
     private fun setTextDirect(text: String) {
         val tv = textView ?: return
+        tv.maxLines = 10   // never truncate — show complete sentence
         tv.text = text
         if (tv.alpha < 0.5f) {
             tv.animate().cancel()
-            tv.animate().alpha(1f).setDuration(100).start()
+            tv.animate().alpha(1f).setDuration(120).start()
         }
     }
 
