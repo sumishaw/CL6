@@ -135,9 +135,20 @@ class OverlayService : Service() {
     private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
         val token = tokenCounter.incrementAndGet()
-        backlog.offer(Item(token, hindi.trim()))
+
+        if (holdMs == 0L) {
+            // Live mode: show immediately, replace whatever is showing
+            cancelTimers()
+            active = false
+            backlog.clear()
+            backlog.offer(Item(token, hindi.trim()))
+            advance()
+        } else {
+            // Timed mode: queue and advance when ready
+            backlog.offer(Item(token, hindi.trim()))
+            if (!active) advance()
+        }
         reschedSilence()
-        if (!active) advance()
     }
 
     private fun onClear() {
@@ -170,17 +181,17 @@ class OverlayService : Service() {
 
         active = true
 
-        // Show FULL sentence immediately — no word-by-word
+        // Show FULL sentence immediately
         setTextDirect(item.text)
 
-        // Hold time: use holdMs, or if Live mode (0), just show until next arrives
-        val hold = if (holdMs == 0L) 8_000L else holdMs   // 8s default in Live mode
+        // In Live mode: hold 10s max (will be replaced by next translation before that)
+        // In timed mode: hold for holdMs then advance
+        val hold = if (holdMs == 0L) 10_000L else holdMs
 
         holdRunnable = Runnable {
             holdRunnable = null
             if (!alive) return@Runnable
-            if (item.token < expectedToken) { active = false; fadeOut(); advance(); return@Runnable }
-            // If more items queued, advance immediately; else fade out
+            if (item.token < expectedToken) { active = false; fadeOut(); return@Runnable }
             if (backlog.isNotEmpty()) {
                 active = false; advance()
             } else {
