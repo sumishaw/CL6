@@ -193,6 +193,29 @@ class MainActivity : FlutterActivity() {
                         "hindi"    to SpeechCaptureService.latestHindi
                     ))
 
+                "getLogs" -> {
+                    val n = (call.arguments as? Int) ?: 300
+                    result.success(CaptionLogger.getRecentLines(n))
+                }
+
+                "clearLogs" -> {
+                    CaptionLogger.clearLines()
+                    result.success(null)
+                }
+
+                "getGenderStatus" -> {
+                    result.success(mapOf(
+                        "detected"  to if (HindiTtsService.detectedGender == HindiTtsService.Gender.FEMALE) "female" else "male",
+                        "selected"  to when (HindiTtsService.selectedGender) {
+                            HindiTtsService.Gender.FEMALE -> "female"
+                            HindiTtsService.Gender.MALE   -> "male"
+                            else                          -> "auto"
+                        },
+                        "enabled"   to GenderAnalyzer.enabled,
+                        "speaking"  to HindiTtsService.isSpeaking
+                    ))
+                }
+
                 else -> result.notImplemented()
             }
         }
