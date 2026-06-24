@@ -21,34 +21,20 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 
-/**
- * MainActivity
- *
- * Manages the Flutter MethodChannel bridge and whisper server health monitoring.
- *
- * Reconnect additions:
- *   • notifyWhisperDisconnected() — tells Flutter UI to show "Whisper Unreachable" card
- *   • notifyWhisperReconnected()  — tells Flutter UI to show "Speech Model Ready" card
- *   • Periodic background health check every 30 s while capture is NOT running,
- *     so the status card stays accurate when the user is on the home screen.
- */
 class MainActivity : FlutterActivity() {
 
     companion object {
         @Volatile var instance: MainActivity? = null
 
-        // LC-mode MediaProjection for GenderAnalyzer (headphone-safe internal audio)
+        // LC-mode MediaProjection for GenderAnalyzer
         @Volatile var lcProjection: android.media.projection.MediaProjection? = null
 
         private const val REQ_MEDIA_PROJECTION  = 200
         private const val REQ_GENDER_PROJECTION  = 201
         private const val REQ_AUDIO_PERMISSION   = 100
         private const val TAG                    = "MainActivity"
-
-        private const val WHISPER_HEALTH_URL = "http://127.0.0.1:8765/ready"
-
-        /** Interval for background health polling when capture is idle (ms). */
-        private const val IDLE_HEALTH_POLL_MS = 30_000L
+        private const val WHISPER_HEALTH_URL     = "http://127.0.0.1:8765/ready"
+        private const val IDLE_HEALTH_POLL_MS    = 30_000L
     }
 
     private val CHANNEL = "overlay_channel"
@@ -59,11 +45,7 @@ class MainActivity : FlutterActivity() {
 
     private val healthExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler    = Handler(Looper.getMainLooper())
-
-    /** Background idle-poll runnable — runs only while capture is stopped. */
     private var idlePollRunnable: Runnable? = null
-
-    // ── Flutter method channel ─────────────────────────────────────────────────
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -103,9 +85,6 @@ class MainActivity : FlutterActivity() {
                     requestAudioThenProjection(result)
 
                 "checkAccessibilityEnabled" -> result.success(true)
-                "openAccessibilitySettings" -> result.success(true)
-
-                // ── Whisper server readiness checks ──────────────────────────
 
                 "isModelReady" -> checkWhisperReady { ready ->
                     runOnUiThread { result.success(ready) }
@@ -127,19 +106,13 @@ class MainActivity : FlutterActivity() {
                 "startOverlay" -> {
                     val i = Intent(this, OverlayService::class.java)
                     startForegroundServiceCompat(i)
-                    // Mute mic — prevents TTS audio from reaching Live Captions via mic
-                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
-                    am.isMicrophoneMute = true
-                    // Request MediaProjection for GenderAnalyzer internal audio capture
-                    // (works with headphones, unlike mic which goes silent)
-                    requestGenderProjection()
+                    // NOTE: mic NOT muted — GenderAnalyzer uses USAGE_MEDIA internal audio.
+                    // isSuppressed() in micLoop handles TTS separation in fallback mode.
                     result.success(true)
                 }
 
                 "stopOverlay" -> {
                     stopService(Intent(this, OverlayService::class.java))
-                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
-                    am.isMicrophoneMute = false
                     GenderAnalyzer.stop()
                     result.success(true)
                 }
@@ -147,14 +120,14 @@ class MainActivity : FlutterActivity() {
                 // ── Speech capture ────────────────────────────────────────────
 
                 "startSpeechCapture" -> {
-                    stopIdlePoll()   // SpeechCaptureService manages its own reconnect now
+                    stopIdlePoll()
                     requestAudioThenProjection(result)
                 }
 
                 "stopSpeechCapture" -> {
                     stopService(Intent(this, SpeechCaptureService::class.java))
                     result.success(true)
-                    startIdlePoll()  // resume idle polling while capture is stopped
+                    startIdlePoll()
                 }
 
                 "isSpeechCaptureRunning" ->
@@ -201,6 +174,31 @@ class MainActivity : FlutterActivity() {
                         "hindi"    to SpeechCaptureService.latestHindi
                     ))
 
+                // ── Log viewer ────────────────────────────────────────────────
+
+                "getLogs" -> {
+                    val n = (call.arguments as? Int) ?: 300
+                    result.success(CaptionLogger.getRecentLines(n))
+                }
+
+                "clearLogs" -> {
+                    CaptionLogger.clearLines()
+                    result.success(null)
+                }
+
+                "getGenderStatus" -> {
+                    result.success(mapOf(
+                        "detected"  to if (HindiTtsService.detectedGender == HindiTtsService.Gender.FEMALE) "female" else "male",
+                        "selected"  to when (HindiTtsService.selectedGender) {
+                            HindiTtsService.Gender.FEMALE -> "female"
+                            HindiTtsService.Gender.MALE   -> "male"
+                            else                          -> "auto"
+                        },
+                        "enabled"   to GenderAnalyzer.enabled,
+                        "speaking"  to HindiTtsService.isSpeaking
+                    ))
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -217,7 +215,6 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         instance = this
-        // Re-check whisper status every time the user comes back to the app
         if (!SpeechCaptureService.isRunning) {
             checkAndNotifyWhisperReady()
         }
@@ -225,7 +222,6 @@ class MainActivity : FlutterActivity() {
 
     override fun onPause() {
         super.onPause()
-        // Keep idle polling running in background so status card is fresh on resume
     }
 
     override fun onDestroy() {
@@ -238,7 +234,7 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    // ── Idle health polling (when capture is not running) ──────────────────────
+    // ── Idle health polling ───────────────────────────────────────────────────
 
     private fun startIdlePoll() {
         stopIdlePoll()
@@ -259,7 +255,7 @@ class MainActivity : FlutterActivity() {
         idlePollRunnable = null
     }
 
-    // ── Whisper server health checks ──────────────────────────────────────────
+    // ── Whisper server health ─────────────────────────────────────────────────
 
     private fun checkWhisperReady(onResult: (Boolean) -> Unit) {
         healthExecutor.submit {
@@ -272,9 +268,7 @@ class MainActivity : FlutterActivity() {
                 val code = conn.responseCode
                 conn.disconnect()
                 code == 200
-            } catch (_: Exception) {
-                false
-            }
+            } catch (_: Exception) { false }
             onResult(ready)
         }
     }
@@ -283,10 +277,8 @@ class MainActivity : FlutterActivity() {
         checkWhisperReady { ready ->
             runOnUiThread {
                 if (ready) {
-                    Log.d(TAG, "whisper_server.py is ready")
                     methodChannel?.invokeMethod("onModelReady", null)
                 } else {
-                    Log.w(TAG, "whisper_server.py not reachable on port 8765")
                     methodChannel?.invokeMethod(
                         "onModelError",
                         mapOf("message" to
@@ -299,14 +291,9 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // ── Called by SpeechCaptureService to update Flutter UI on reconnect ───────
+    // ── Flutter callbacks from Kotlin services ────────────────────────────────
 
-    /**
-     * Called by SpeechCaptureService when whisper becomes unreachable.
-     * Updates the Flutter model-status card to show the error state.
-     */
     fun onLiveCaptionReaderConnected() {
-        Log.i(TAG, "LiveCaptionReader connected")
         mainHandler.post {
             methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
         }
@@ -314,29 +301,18 @@ class MainActivity : FlutterActivity() {
 
     fun notifyWhisperDisconnected() {
         runOnUiThread {
-            Log.w(TAG, "Notifying Flutter: whisper disconnected")
             methodChannel?.invokeMethod(
                 "onModelError",
                 mapOf("message" to
-                    "Whisper server disconnected.\n" +
-                    "Reconnecting automatically…\n" +
-                    "Tap RETRY if this persists.")
+                    "Whisper server disconnected.\nReconnecting automatically…\nTap RETRY if this persists.")
             )
         }
     }
 
-    /**
-     * Called by SpeechCaptureService when whisper comes back online.
-     * Updates the Flutter model-status card to show ready state.
-     */
     fun notifyWhisperReconnected() {
-        runOnUiThread {
-            Log.d(TAG, "Notifying Flutter: whisper reconnected")
-            methodChannel?.invokeMethod("onModelReady", null)
-        }
+        runOnUiThread { methodChannel?.invokeMethod("onModelReady", null) }
     }
 
-    /** Called from SpeechCaptureService to push a translation to the Flutter UI. */
     fun onTranslation(original: String, english: String, hindi: String) {
         runOnUiThread {
             methodChannel?.invokeMethod("onTranslation", mapOf(
@@ -349,34 +325,16 @@ class MainActivity : FlutterActivity() {
 
     // ── Permission + projection flow ──────────────────────────────────────────
 
-    private fun requestGenderProjection() {
-        // Request MediaProjection for GenderAnalyzer only — no dialog if already granted
-        if (lcProjection != null) return   // already have one
-        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
-        try {
-            @Suppress("DEPRECATION")
-            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_GENDER_PROJECTION)
-        } catch (e: Exception) {
-            Log.w(TAG, "Gender projection request failed: ${e.message}")
-        }
-    }
-
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
-        if (!Settings.canDrawOverlays(this)) {
-            result.success(false); return
-        }
-
+        if (!Settings.canDrawOverlays(this)) { result.success(false); return }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
+            == PackageManager.PERMISSION_GRANTED) {
             requestMediaProjection(result)
         } else {
             deliverPendingFailure()
             pendingProjectionResult = result
             ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                REQ_AUDIO_PERMISSION
+                this, arrayOf(Manifest.permission.RECORD_AUDIO), REQ_AUDIO_PERMISSION
             )
         }
     }
@@ -389,28 +347,21 @@ class MainActivity : FlutterActivity() {
             @Suppress("DEPRECATION")
             startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
         } catch (e: Exception) {
-            Log.e(TAG, "createScreenCaptureIntent failed: ${e.message}")
             pendingProjectionResult = null
             result.success(false)
         }
     }
 
     override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_AUDIO_PERMISSION) {
             val pending = pendingProjectionResult
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if (pending != null) {
-                    pendingProjectionResult = null
-                    requestMediaProjection(pending)
-                }
+                if (pending != null) { pendingProjectionResult = null; requestMediaProjection(pending) }
             } else {
-                pendingProjectionResult = null
-                pending?.success(false)
+                pendingProjectionResult = null; pending?.success(false)
             }
         }
     }
@@ -421,16 +372,15 @@ class MainActivity : FlutterActivity() {
 
         if (requestCode == REQ_GENDER_PROJECTION) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE)
+                    as android.media.projection.MediaProjectionManager
                 lcProjection = mgr.getMediaProjection(resultCode, data)
-                Log.d(TAG, "Gender projection granted")
                 CaptionLogger.log("MainActivity", "Gender projection granted")
-                // If LiveCaptionReader is already connected, restart with projection
                 if (LiveCaptionReader.isRunning) {
                     lcProjection?.let { GenderAnalyzer.start(it) }
                 }
             } else {
-                Log.w(TAG, "Gender projection denied — mic fallback will be used")
+                CaptionLogger.log("MainActivity", "Gender projection denied")
             }
             return
         }
@@ -438,21 +388,14 @@ class MainActivity : FlutterActivity() {
         if (requestCode == REQ_MEDIA_PROJECTION) {
             val pending = pendingProjectionResult
             pendingProjectionResult = null
-
             if (resultCode == Activity.RESULT_OK && data != null) {
-                Log.d(TAG, "MediaProjection granted — starting SpeechCaptureService + GenderAnalyzer")
                 val i = Intent(this, SpeechCaptureService::class.java).apply {
                     putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
                     putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
                 }
                 startForegroundServiceCompat(i)
-
-                // GenderAnalyzer is started by SpeechCaptureService.startCapture()
-                // and fed PCM directly from the shared AudioRecord — no MediaProjection needed here.
-
                 pending?.success(true)
             } else {
-                Log.w(TAG, "MediaProjection denied (resultCode=$resultCode)")
                 pending?.success(false)
             }
         }
@@ -461,18 +404,12 @@ class MainActivity : FlutterActivity() {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun startForegroundServiceCompat(intent: Intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else startService(intent)
     }
 
     private fun deliverPendingFailure() {
         val stale = pendingProjectionResult
-        if (stale != null) {
-            pendingProjectionResult = null
-            try { stale.success(false) } catch (_: Exception) {}
-        }
+        if (stale != null) { pendingProjectionResult = null; try { stale.success(false) } catch (_: Exception) {} }
     }
 }
