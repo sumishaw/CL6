@@ -37,9 +37,13 @@ class MainActivity : FlutterActivity() {
     companion object {
         @Volatile var instance: MainActivity? = null
 
-        private const val REQ_MEDIA_PROJECTION = 200
-        private const val REQ_AUDIO_PERMISSION  = 100
-        private const val TAG                   = "MainActivity"
+        // LC-mode MediaProjection for GenderAnalyzer (headphone-safe internal audio)
+        @Volatile var lcProjection: android.media.projection.MediaProjection? = null
+
+        private const val REQ_MEDIA_PROJECTION  = 200
+        private const val REQ_GENDER_PROJECTION  = 201
+        private const val REQ_AUDIO_PERMISSION   = 100
+        private const val TAG                    = "MainActivity"
 
         private const val WHISPER_HEALTH_URL = "http://127.0.0.1:8765/ready"
 
@@ -51,6 +55,7 @@ class MainActivity : FlutterActivity() {
     private var methodChannel: MethodChannel? = null
 
     @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
+    @Volatile private var pendingGenderResult:     MethodChannel.Result? = null
 
     private val healthExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler    = Handler(Looper.getMainLooper())
@@ -125,6 +130,9 @@ class MainActivity : FlutterActivity() {
                     // Mute mic — prevents TTS audio from reaching Live Captions via mic
                     val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
                     am.isMicrophoneMute = true
+                    // Request MediaProjection for GenderAnalyzer internal audio capture
+                    // (works with headphones, unlike mic which goes silent)
+                    requestGenderProjection()
                     result.success(true)
                 }
 
@@ -192,29 +200,6 @@ class MainActivity : FlutterActivity() {
                         "english"  to SpeechCaptureService.latestEnglish,
                         "hindi"    to SpeechCaptureService.latestHindi
                     ))
-
-                "getLogs" -> {
-                    val n = (call.arguments as? Int) ?: 300
-                    result.success(CaptionLogger.getRecentLines(n))
-                }
-
-                "clearLogs" -> {
-                    CaptionLogger.clearLines()
-                    result.success(null)
-                }
-
-                "getGenderStatus" -> {
-                    result.success(mapOf(
-                        "detected"  to if (HindiTtsService.detectedGender == HindiTtsService.Gender.FEMALE) "female" else "male",
-                        "selected"  to when (HindiTtsService.selectedGender) {
-                            HindiTtsService.Gender.FEMALE -> "female"
-                            HindiTtsService.Gender.MALE   -> "male"
-                            else                          -> "auto"
-                        },
-                        "enabled"   to GenderAnalyzer.enabled,
-                        "speaking"  to HindiTtsService.isSpeaking
-                    ))
-                }
 
                 else -> result.notImplemented()
             }
@@ -364,6 +349,18 @@ class MainActivity : FlutterActivity() {
 
     // ── Permission + projection flow ──────────────────────────────────────────
 
+    private fun requestGenderProjection() {
+        // Request MediaProjection for GenderAnalyzer only — no dialog if already granted
+        if (lcProjection != null) return   // already have one
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_GENDER_PROJECTION)
+        } catch (e: Exception) {
+            Log.w(TAG, "Gender projection request failed: ${e.message}")
+        }
+    }
+
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
         if (!Settings.canDrawOverlays(this)) {
             result.success(false); return
@@ -421,6 +418,22 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Required for API compatibility below 33")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == REQ_GENDER_PROJECTION) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+                lcProjection = mgr.getMediaProjection(resultCode, data)
+                Log.d(TAG, "Gender projection granted")
+                CaptionLogger.log("MainActivity", "Gender projection granted")
+                // If LiveCaptionReader is already connected, restart with projection
+                if (LiveCaptionReader.isRunning) {
+                    lcProjection?.let { GenderAnalyzer.startMic(it) }
+                }
+            } else {
+                Log.w(TAG, "Gender projection denied — mic fallback will be used")
+            }
+            return
+        }
 
         if (requestCode == REQ_MEDIA_PROJECTION) {
             val pending = pendingProjectionResult
