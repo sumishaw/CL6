@@ -40,6 +40,7 @@ class SpeechCaptureService : Service() {
         const val NOTIF_ID          = 2
         const val EXTRA_RESULT_CODE  = "result_code"
         const val EXTRA_RESULT_DATA  = "result_data"
+        const val EXTRA_GENDER_ONLY  = "gender_only"
 
         @Volatile var isRunning      = false
         @Volatile var targetLanguage = "hindi"
@@ -155,6 +156,15 @@ class SpeechCaptureService : Service() {
             }, Handler(Looper.getMainLooper()))
         }
 
+        // Gender-only mode: LC mode — hold projection for GenderAnalyzer, skip Whisper
+        val genderOnly = intent?.getBooleanExtra(EXTRA_GENDER_ONLY, false) ?: false
+        if (genderOnly) {
+            updateNotification("Voice gender detection active")
+            CaptionLogger.log("SCS", "gender-only mode — starting GenderAnalyzer with projection")
+            GenderAnalyzer.start(sharedProjection)
+            return START_STICKY   // stay alive to keep projection valid
+        }
+
         startCapture()
         scheduleWatchdog()
         return START_NOT_STICKY
@@ -255,7 +265,7 @@ class SpeechCaptureService : Service() {
         capturing.set(true)
         ar.startRecording()
         // Start GenderAnalyzer with dedicated USAGE_MEDIA capture (separate from our capture)
-        GenderAnalyzer.start()
+        GenderAnalyzer.start(sharedProjection)
         updateNotification("Translating video audio to Hindi…")
         mainHandler.post { OverlayService.updateText("", "") }
 
