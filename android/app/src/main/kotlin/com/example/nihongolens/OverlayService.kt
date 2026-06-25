@@ -54,16 +54,22 @@ class OverlayService : Service() {
             instance?.handler?.post { instance?.onNewHindi(hindi) }
         }
 
-        // Called by TTS play worker — subtitle already showing, just ensure visible
+        // Called by TTS play worker when it STARTS speaking a sentence.
+        // Shows the Hindi subtitle in sync with the audio — this is the FIFO refresh.
+        // The subtitle that appears is exactly what is being spoken right now.
         fun showTtsText(hindi: String) {
-            // No-op: subtitle already shown by updateText above
-            // Kept for future use (e.g. highlight current word)
+            instance?.handler?.post {
+                instance?.setTextDirect(hindi)
+            }
         }
 
-        // Called by TTS play worker when speech ends
+        // Called by TTS play worker when speech ends.
+        // Advances the subtitle display to the next queued item (FIFO refresh).
+        // If nothing queued, starts fade-out timer.
         fun clearTtsText() {
-            // No-op: subtitle persists until next translation arrives
-            // OverlayService backlog timer handles fade-out via reschedSilence
+            instance?.handler?.post {
+                instance?.onTtsComplete()
+            }
         }
         fun clearQueue() {
             instance?.handler?.post { instance?.onClear() }
@@ -199,6 +205,24 @@ class OverlayService : Service() {
             }
         }
         handler.postDelayed(holdRunnable!!, hold)
+    }
+
+    // Called when TTS finishes speaking one sentence.
+    // Advances display to next queued subtitle (FIFO), or fades out if empty.
+    private fun onTtsComplete() {
+        cancelTimers()
+        if (backlog.isNotEmpty()) {
+            active = false
+            advance()
+        } else {
+            // Nothing queued — keep showing current subtitle briefly then fade
+            holdRunnable = Runnable {
+                holdRunnable = null
+                if (backlog.isEmpty()) fadeOut()
+                else { active = false; advance() }
+            }
+            handler.postDelayed(holdRunnable!!, 1_500L)
+        }
     }
 
     // ── View helpers ──────────────────────────────────────────────────────────
