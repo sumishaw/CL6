@@ -48,7 +48,8 @@ object HindiTtsService {
         BREATHY, WHISPERY, HUSHED, MURMURED,
         VELVETY, SULTRY, WARM, TENDER,
         HUSKY, RASPY, GRAVELLY, STRAINED,
-        SIGHING, PANTING, MOANING, GASPING;
+        SIGHING, PANTING, MOANING, GASPING,
+        SINGING;   // sustained vocal performance
 
         val speedMult: Float get() = when (this) {
             HAPPY->1.12f; SAD->0.85f; ANGRY->1.05f; FEARFUL->0.95f
@@ -57,6 +58,7 @@ object HindiTtsService {
             VELVETY->0.92f; SULTRY->0.88f; WARM->0.95f; TENDER->0.90f
             HUSKY->0.93f; RASPY->1.00f; GRAVELLY->0.85f; STRAINED->1.10f
             SIGHING->0.80f; PANTING->1.20f; MOANING->0.75f; GASPING->1.15f
+            SINGING->0.88f
             else->1.00f
         }
         val pitchMult: Float get() = when (this) {
@@ -66,6 +68,8 @@ object HindiTtsService {
             VELVETY->0.96f; SULTRY->0.88f; WARM->0.97f; TENDER->0.94f
             HUSKY->0.92f; RASPY->0.88f; GRAVELLY->0.85f; STRAINED->1.08f
             SIGHING->0.90f; PANTING->1.05f; MOANING->0.87f; GASPING->1.12f
+            SINGING->1.00f  // neutral pitch — melody is in the content
+            SINGING->1.00f
             else->1.00f
         }
         val category: String get() = when(this) {
@@ -74,6 +78,7 @@ object HindiTtsService {
             VELVETY,SULTRY,WARM,TENDER -> "warm"
             HUSKY,RASPY,GRAVELLY,STRAINED -> "intense"
             SIGHING,PANTING,MOANING,GASPING -> "rhythmic"
+            SINGING -> "singing"
         }
     }
 
@@ -353,10 +358,14 @@ object HindiTtsService {
         val manager = am ?: return
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             val req = android.media.AudioFocusRequest.Builder(
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                // MAY_DUCK: background music ducks to ~30% but keeps playing
+                // EXCLUSIVE would silence everything — wrong for mimicry
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                 .setAudioAttributes(AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setWillPauseWhenDucked(false)   // don't pause, just duck
+                .setAcceptsDelayedFocusGain(true) // smooth transition
                 .setOnAudioFocusChangeListener {}.build()
             focusRequest = req
             manager.requestAudioFocus(req)
