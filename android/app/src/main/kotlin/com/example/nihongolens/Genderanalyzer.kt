@@ -9,9 +9,9 @@ import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlin.math.*
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.atomic.AtomicInteger
+import java.io.RandomAccessFile
+import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * GenderAnalyzer v10 — Full Voice Profile extraction from USAGE_MEDIA internal audio.
@@ -94,14 +94,14 @@ object GenderAnalyzer {
     private var captureJob:    Job?         = null
     private var captureRec:    AudioRecord? = null
 
-    // ── Background audio streaming to TTS server ─────────────────────────────
-    // Every 256ms we POST raw PCM to /bg_audio on the TTS server.
-    // The server mixes it (at 25% volume) into every TTS WAV it synthesises.
-    // This bakes background music INTO the TTS audio — no Android ducking.
+    // ── Background audio shared file ─────────────────────────────────────────
+    // Captured USAGE_MEDIA PCM written to a circular file on disk.
+    // TTS server reads this file directly at synthesis time — zero latency.
+    // File: bg_pcm.raw in app files dir — 3s circular buffer (96KB)
     private var bgDucked       = false
-    private val BG_SERVER_URL  = "http://127.0.0.1:8766/bg_audio"
-    private val bgFrameCounter = AtomicInteger(0)  // send every 2nd WIN (256ms)
-    private var bgSendJob:     Job? = null
+    private var bgFile:        RandomAccessFile? = null
+    private val BG_FILE_BYTES  = 16000 * 2 * 3   // 3s × 16kHz × 2 bytes/sample = 96000
+    private val bgWritePos     = AtomicLong(0L)   // circular write position
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ object GenderAnalyzer {
     fun stop() {
         enabled = false
         captureJob?.cancel(); captureJob = null
-        bgSendJob?.cancel(); bgSendJob = null
+        try { bgFile?.close() } catch (_: Exception) {}; bgFile = null
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
@@ -173,6 +173,21 @@ object GenderAnalyzer {
         rec.startRecording()
         CaptionLogger.log(TAG, ">>> VOICE PROFILE CAPTURE STARTED SR=${SR}Hz <<<")
 
+        // Open circular PCM file for TTS server to read BG audio from
+        try {
+            val filesDir = android.app.ActivityThread.currentApplication()
+                ?.filesDir?.absolutePath ?: "/data/data/com.example.nihongolens/files"
+            val bgPath = "$filesDir/bg_pcm.raw"
+            bgFile = RandomAccessFile(bgPath, "rw")
+            bgFile?.setLength(BG_FILE_BYTES.toLong())  // pre-allocate 96KB circular buffer
+            // Write path to a companion file so server knows where to find it
+            File("$filesDir/bg_pcm.path").writeText(bgPath)
+            CaptionLogger.log(TAG, "BG PCM file: $bgPath (${BG_FILE_BYTES/1024}KB circular)")
+        } catch (e: Exception) {
+            CaptionLogger.log(TAG, "BG file init failed: ${e.message}")
+            bgFile = null
+        }
+
 
 
         val buf = ByteArray(WIN * 2); var reads = 0
@@ -183,13 +198,29 @@ object GenderAnalyzer {
                     n > 0 -> {
                         reads++
                         if (reads == 1) CaptionLogger.log(TAG, "FIRST read — media audio flowing!")
-ingest(buf, n)
+                        // Write to circular PCM file — TTS server reads this for BG mixing
+                        bgFile?.let { f ->
+                            try {
+                                val pos = (bgWritePos.getAndAdd(n.toLong())) % BG_FILE_BYTES
+                                f.seek(pos)
+                                val space = (BG_FILE_BYTES - pos).toInt()
+                                if (n <= space) {
+                                    f.write(buf, 0, n)
+                                } else {
+                                    f.write(buf, 0, space)
+                                    f.seek(0)
+                                    f.write(buf, space, n - space)
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        ingest(buf, n)
                     }
                     n < 0 -> { CaptionLogger.log(TAG, "read error=$n"); break }
                 }
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
+            try { bgFile?.close() } catch (_: Exception) {}; bgFile = null
             captureRec = null; enabled = false
         }
     }
@@ -413,24 +444,8 @@ ingest(buf, n)
 
     // ── Background audio streaming ───────────────────────────────────────────
 
-    /** POST raw 16kHz mono PCM to TTS server's rolling background buffer. */
-    private fun sendBgAudio(pcm: ByteArray) {
-        try {
-            val conn = URL(BG_SERVER_URL).openConnection() as HttpURLConnection
-            conn.requestMethod        = "POST"
-            conn.doOutput             = true
-            conn.connectTimeout       = 200   // fast — don't block if server busy
-            conn.readTimeout          = 200
-            conn.setRequestProperty("Content-Type", "application/octet-stream")
-            conn.setRequestProperty("Content-Length", pcm.size.toString())
-            conn.outputStream.use { it.write(pcm) }
             conn.responseCode         // trigger send
             conn.disconnect()
-        } catch (_: Exception) {
-            // Silent — BG streaming is best-effort, never blocks TTS
-        }
-    }
-
     // ── Background audio (Android handles mixing automatically) ──────────────
     // USAGE_MEDIA (video) and USAGE_ASSISTANT (TTS) are mixed by Android AudioManager.
     // No manual ducking needed — AudioFocus system handles volume balance.
